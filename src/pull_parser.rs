@@ -33,7 +33,23 @@ pub trait Rule: Copy {
     }
 }
 
-pub fn single<T, F: FnOnce(&T) -> bool>(fun: F) -> impl Rule<Token = T, Output = T> {
+pub trait NamedRule {
+    type Token;
+    type Output;
+
+    fn get(self) -> impl Rule<Token = Self::Token, Output = Self::Output>;
+}
+
+impl<T: NamedRule + Copy> Rule for T {
+    type Token = <T as NamedRule>::Token;
+    type Output = <T as NamedRule>::Output;
+
+    fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
+        self.get().parse(input)
+    }
+}
+
+pub fn single<T, F: FnOnce(&T) -> bool + Copy>(fun: F) -> impl Rule<Token = T, Output = T> {
     Single(fun, PhantomData)
 }
 
@@ -65,8 +81,8 @@ impl<T, F: FnOnce(&T) -> bool + Copy> Rule for Single<T, F> {
     type Output = T;
 
     fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
-        if (self.0)(self.source.peek()) {
-            Some(self.source.get())
+        if (self.0)(input.peek()) {
+            Some(input.get())
         } else {
             None
         }
@@ -122,7 +138,7 @@ where
 
     fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
         let mut out = vec![];
-        while let Some(item) = self.rule.parse(input) {
+        while let Some(item) = self.0.parse(input) {
             out.push(item)
         }
         Some(out)
