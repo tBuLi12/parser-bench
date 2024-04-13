@@ -1,7 +1,9 @@
 use std::time::Instant;
 
+mod pull_fix_parser;
 mod pull_parser;
 mod push_parser;
+mod stack_parser;
 
 // #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 // enum Keyword {
