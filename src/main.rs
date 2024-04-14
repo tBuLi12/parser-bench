@@ -27,12 +27,32 @@ enum Token {
     Number(usize),
     Punctuation(Punctuation),
     Eof,
-    Inserted,
+    Inserted(TokenKind),
 }
 
-impl Default for Token {
-    fn default() -> Self {
-        Token::Inserted
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenKind {
+    String,
+    Number,
+    Punctuation(Punctuation),
+    Eof,
+}
+
+impl pull_fix_parser::Token for Token {
+    type Kind = TokenKind;
+
+    fn kind(&self) -> Self::Kind {
+        match self {
+            Self::String(_) => TokenKind::String,
+            Self::Number(_) => TokenKind::Number,
+            Self::Punctuation(p) => TokenKind::Punctuation(*p),
+            Self::Eof => TokenKind::Eof,
+            Self::Inserted(kind) => *kind,
+        }
+    }
+
+    fn inserted(kind: Self::Kind) -> Self {
+        Self::Inserted(kind)
     }
 }
 
@@ -173,22 +193,14 @@ mod pull_grammar {
 }
 
 mod pull_fix_grammar {
-    use crate::{pull_fix_parser::*, Json, Punctuation, Token};
+    use crate::{pull_fix_parser::*, Json, Punctuation, Token, TokenKind};
 
     fn punctuation(punct: Punctuation) -> impl Rule<Token = Token, Output = ()> {
-        single(move |token: &Token| match token {
-            Token::Punctuation(p) if *p == punct => true,
-            _ => false,
-        })
-        .map(|_| ())
+        single(TokenKind::Punctuation(punct)).map(|_| ())
     }
 
     fn string() -> impl Rule<Token = Token, Output = String> {
-        single(move |token: &Token| match token {
-            Token::String(_) => true,
-            _ => false,
-        })
-        .map(|token| {
+        single(TokenKind::String).map(|token| {
             if let Token::String(value) = token {
                 value
             } else {
@@ -198,11 +210,7 @@ mod pull_fix_grammar {
     }
 
     fn number() -> impl Rule<Token = Token, Output = usize> {
-        single(move |token: &Token| match token {
-            Token::Number(_) => true,
-            _ => false,
-        })
-        .map(|token| {
+        single(TokenKind::Number).map(|token| {
             if let Token::Number(value) = token {
                 value
             } else {
@@ -277,8 +285,13 @@ mod pull_fix_grammar {
         }
     }
 
-    pub fn grammar() -> impl Rule<Token = Token, Output = Json> {
-        JsonRule
+    pub fn grammar() -> impl Rule<Token = Token, Output = ()> {
+        punctuation(Punctuation::LBrace)
+            .and(string())
+            .and(punctuation(Punctuation::Colon))
+            .and(string())
+            .and(punctuation(Punctuation::RBrace))
+            .map(|_| {})
     }
 }
 
@@ -397,8 +410,8 @@ fn main() {
         i: 0,
         items: vec![
             Token::Punctuation(Punctuation::LBrace),
-            Token::String("key".to_string()),
-            Token::Punctuation(Punctuation::Colon),
+            // Token::String("key".to_string()),
+            // Token::Punctuation(Punctuation::Colon),
             Token::String("value".to_string()),
             Token::Punctuation(Punctuation::RBrace),
         ],
@@ -407,7 +420,8 @@ fn main() {
     use pull_fix_parser::Rule;
     let grammar = pull_fix_grammar::grammar();
 
-    grammar.get_edits_no_follow(&input.items);
+    let edits = grammar.get_edits_no_follow(&input.items, 5);
+    eprintln!("{:?}", edits);
 
     // eprintln!("{:#?}", grammar.parse(&mut input));
 

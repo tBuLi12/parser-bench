@@ -3,25 +3,32 @@ use std::{fmt::Debug, marker::PhantomData};
 
 use crate::Source;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+pub trait Token: Clone + Eq + Debug {
+    type Kind: Eq + Copy;
+
+    fn kind(&self) -> Self::Kind;
+    fn inserted(kind: Self::Kind) -> Self;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Edit<T> {
     Insert(T),
     Delete,
     Keep,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub struct Edits<T>(Vec<Edit<T>>);
 
-impl<T: PartialEq> std::cmp::PartialOrd for Edits<T> {
+impl<T: PartialEq + Token> std::cmp::PartialOrd for Edits<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.len().partial_cmp(&other.0.len())
+        self.cost().partial_cmp(&other.cost())
     }
 }
 
-impl<T: Eq> std::cmp::Ord for Edits<T> {
+impl<T: Eq + Token> std::cmp::Ord for Edits<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.len().cmp(&other.0.len())
+        self.cost().cmp(&other.cost())
     }
 }
 
@@ -45,25 +52,34 @@ impl<T, EI: Iterator<Item = Edit<T>>, TI: Iterator<Item = T>> Iterator for Edits
     }
 }
 
-impl<T: Default + Clone + Eq> Edits<T> {
+impl<T: Token> Edits<T> {
     fn apply_to(self, iter: impl Iterator<Item = T>) -> impl Iterator<Item = T> {
         EditsIter {
             tokens: iter,
             edits: self.0.into_iter(),
         }
     }
+
+    fn cost(&self) -> usize {
+        self.0.iter().filter(|&edit| *edit != Edit::Keep).count()
+    }
 }
 
 pub trait Rule: Copy + std::fmt::Debug {
-    type Token: Default + Clone + Eq;
+    type Token: Token;
     type Output;
     fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output>;
     fn get_edits(
         self,
         tokens: &[Self::Token],
         follow: impl Rule<Token = Self::Token>,
+        inserts_remaining: usize,
     ) -> Edits<Self::Token>;
-    fn get_edits_no_follow(self, tokens: &[Self::Token]) -> Edits<Self::Token>;
+    fn get_edits_no_follow(
+        self,
+        tokens: &[Self::Token],
+        inserts_remaining: usize,
+    ) -> Edits<Self::Token>;
 
     fn and<Other: Rule<Token = Self::Token>>(
         self,
@@ -92,7 +108,7 @@ pub trait Rule: Copy + std::fmt::Debug {
 }
 
 pub trait NamedRule {
-    type Token: Default + Clone + Eq;
+    type Token: Token;
     type Output;
 
     fn get(self) -> impl Rule<Token = Self::Token, Output = Self::Output>;
@@ -110,30 +126,36 @@ impl<T: NamedRule + Copy + Debug> Rule for T {
         self,
         tokens: &[Self::Token],
         follow: impl Rule<Token = Self::Token>,
+        inserts_remaining: usize,
     ) -> Edits<Self::Token> {
-        self.get().get_edits(tokens, follow)
+        self.get().get_edits(tokens, follow, inserts_remaining)
     }
 
-    fn get_edits_no_follow(self, tokens: &[Self::Token]) -> Edits<Self::Token> {
-        self.get().get_edits_no_follow(tokens)
+    fn get_edits_no_follow(
+        self,
+        tokens: &[Self::Token],
+        inserts_remaining: usize,
+    ) -> Edits<Self::Token> {
+        self.get().get_edits_no_follow(tokens, inserts_remaining)
     }
 }
 
-pub fn single<T: Default + Clone + Eq, F: FnOnce(&T) -> bool + Copy>(
-    fun: F,
-) -> impl Rule<Token = T, Output = T> {
-    Single(fun, PhantomData)
+// pub fn single<T: Token, F: FnOnce(&T) -> bool + Copy>(fun: F) -> impl Rule<Token = T, Output = T> {
+//     Single(fun, PhantomData)
+// }
+pub fn single<T: Token>(kind: T::Kind) -> impl Rule<Token = T, Output = T> {
+    Single(kind)
 }
 
-struct Single<T, F>(F, PhantomData<fn(&T)>);
-impl<T, F: Copy> Copy for Single<T, F> {}
-impl<T, F: Clone> Clone for Single<T, F> {
+struct Single<T: Token>(T::Kind);
+impl<T: Token> Copy for Single<T> {}
+impl<T: Token> Clone for Single<T> {
     fn clone(&self) -> Self {
-        Single(self.0.clone(), PhantomData)
+        Single(self.0.clone())
     }
 }
 
-impl<T, F> std::fmt::Debug for Single<T, F> {
+impl<T: Token> std::fmt::Debug for Single<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Single")
     }
@@ -160,12 +182,12 @@ impl<R: fmt::Debug, F> fmt::Debug for Map<R, F> {
 #[derive(Clone, Copy, Debug)]
 struct List<R>(R);
 
-impl<T: Default + Clone + Eq, F: FnOnce(&T) -> bool + Copy> Rule for Single<T, F> {
+impl<T: Token> Rule for Single<T> {
     type Token = T;
     type Output = T;
 
     fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
-        if (self.0)(input.peek()) {
+        if input.peek().kind() == self.0 {
             Some(input.get())
         } else {
             None
@@ -176,40 +198,89 @@ impl<T: Default + Clone + Eq, F: FnOnce(&T) -> bool + Copy> Rule for Single<T, F
         self,
         tokens: &[Self::Token],
         follow: impl Rule<Token = Self::Token>,
+        inserts_remaining: usize,
     ) -> Edits<Self::Token> {
-        eprintln!("+{:?} -> {:?}", self, follow);
+        // eprintln!("+{:?} -> {:?} : {:?}", self, follow, tokens);
+
+        if tokens.len() == 0 {
+            return Edits(vec![]);
+        }
+
+        if tokens[0].kind() == self.0 {
+            let mut keep: Edits<T> = Edits(vec![Edit::Keep]);
+            keep.0.extend(
+                follow
+                    .get_edits_no_follow(&tokens[1..], inserts_remaining)
+                    .0
+                    .into_iter(),
+            );
+            return keep;
+        }
+
         let del_count = tokens
             .iter()
-            .position(|t| (self.0)(t))
+            .position(|t| t.kind() == self.0)
             .unwrap_or(tokens.len());
 
-        let dels: Edits<T> = Edits(vec![Edit::Delete; del_count]);
-        let insert = Edits(vec![Edit::Insert(T::default())]);
+        let mut dels: Edits<T> = Edits(vec![Edit::Delete; del_count]);
+        let mut insert = Edits(vec![Edit::Insert(T::inserted(self.0))]);
 
-        let deleted: Vec<T> = dels.apply_to(tokens.iter().cloned()).skip(1).collect();
-        let inserted: Vec<T> = insert.apply_to(tokens.iter().cloned()).skip(1).collect();
-        let del_edits = follow.get_edits_no_follow(&deleted);
-        let insert_edits = follow.get_edits_no_follow(&inserted);
-        eprintln!("-{:?}", self);
-        std::cmp::min(del_edits, insert_edits)
+        let deleted: Vec<T> = dels
+            .clone()
+            .apply_to(tokens.iter().cloned())
+            .skip(1)
+            .collect();
+        let inserted: Vec<T> = insert
+            .clone()
+            .apply_to(tokens.iter().cloned())
+            .skip(1)
+            .collect();
+        let del_edits = follow.get_edits_no_follow(&deleted, inserts_remaining);
+        dels.0.extend(del_edits.0.into_iter());
+
+        if inserts_remaining > 0 {
+            let insert_edits = follow.get_edits_no_follow(&inserted, inserts_remaining - 1);
+            insert.0.extend(insert_edits.0.into_iter());
+            //     eprintln!("-{:?}", self);
+            return std::cmp::min(dels, insert);
+        }
+
+        // eprintln!("-{:?}", self);
+        return dels;
     }
 
-    fn get_edits_no_follow(self, tokens: &[Self::Token]) -> Edits<Self::Token> {
-        eprintln!("+{:?}", self);
+    fn get_edits_no_follow(
+        self,
+        tokens: &[Self::Token],
+        inserts_remaining: usize,
+    ) -> Edits<Self::Token> {
+        if tokens.len() == 0 {
+            return Edits(vec![]);
+        }
+
+        if tokens[0].kind() == self.0 {
+            let keep: Edits<T> = Edits(vec![Edit::Keep]);
+            return keep;
+        }
+
         let del_count = tokens
             .iter()
-            .position(|t| (self.0)(t))
+            .position(|t| t.kind() == self.0)
             .unwrap_or(tokens.len());
 
         let dels: Edits<T> = Edits(vec![Edit::Delete; del_count]);
-        let insert = Edits(vec![Edit::Insert(T::default())]);
 
-        eprintln!("-{:?}", self);
-        std::cmp::min(dels, insert)
+        if inserts_remaining > 0 {
+            let insert = Edits(vec![Edit::Insert(T::inserted(self.0))]);
+            return std::cmp::min(dels, insert);
+        }
+
+        // eprintln!("-{:?}", self);
+        return dels;
     }
 }
 
-impl<T: Default + Clone + Eq, L, R> Rule for And<L, R>
+impl<T: Token, L, R> Rule for And<L, R>
 where
     L: Rule<Token = T>,
     R: Rule<Token = T>,
@@ -227,22 +298,29 @@ where
         self,
         tokens: &[Self::Token],
         follow: impl Rule<Token = Self::Token>,
+        inserts_remaining: usize,
     ) -> Edits<Self::Token> {
-        eprintln!("+{:?} -> {:?}", self, follow);
-        let e = self.0.get_edits(tokens, self.1.and(follow));
-        eprintln!("-{:?}", self);
+        // eprintln!("+{:?} -> {:?} : {:?}", self, follow, tokens);
+        let e = self
+            .0
+            .get_edits(tokens, self.1.and(follow), inserts_remaining);
+        // eprintln!("-{:?}", self);
         e
     }
 
-    fn get_edits_no_follow(self, tokens: &[Self::Token]) -> Edits<Self::Token> {
-        eprintln!("+{:?}", self);
-        let e = self.0.get_edits(tokens, self.1);
-        eprintln!("-{:?}", self);
+    fn get_edits_no_follow(
+        self,
+        tokens: &[Self::Token],
+        inserts_remaining: usize,
+    ) -> Edits<Self::Token> {
+        // eprintln!("+{:?} : {:?}", self, tokens);
+        let e = self.0.get_edits(tokens, self.1, inserts_remaining);
+        // eprintln!("-{:?}", self);
         e
     }
 }
 
-impl<T: Default + Clone + Eq, O, L, R> Rule for Or<L, R>
+impl<T: Token, O, L, R> Rule for Or<L, R>
 where
     L: Rule<Token = T, Output = O>,
     R: Rule<Token = T, Output = O>,
@@ -258,24 +336,29 @@ where
         self,
         tokens: &[Self::Token],
         follow: impl Rule<Token = Self::Token>,
+        inserts_remaining: usize,
     ) -> Edits<Self::Token> {
-        eprintln!("+{:?} -> {:?}", self, follow);
-        let l_edits = self.0.get_edits(tokens, follow);
-        let r_edits = self.1.get_edits(tokens, follow);
-        eprintln!("-{:?}", self);
+        // eprintln!("+{:?} -> {:?} : {:?}", self, follow, tokens);
+        let l_edits = self.0.get_edits(tokens, follow, inserts_remaining);
+        let r_edits = self.1.get_edits(tokens, follow, inserts_remaining);
+        // eprintln!("-{:?}", self);
         std::cmp::min(l_edits, r_edits)
     }
 
-    fn get_edits_no_follow(self, tokens: &[Self::Token]) -> Edits<Self::Token> {
-        eprintln!("+{:?}", self);
-        let l_edits = self.0.get_edits_no_follow(tokens);
-        let r_edits = self.1.get_edits_no_follow(tokens);
-        eprintln!("-{:?}", self);
+    fn get_edits_no_follow(
+        self,
+        tokens: &[Self::Token],
+        inserts_remaining: usize,
+    ) -> Edits<Self::Token> {
+        // eprintln!("+{:?} : {:?}", self, tokens);
+        let l_edits = self.0.get_edits_no_follow(tokens, inserts_remaining);
+        let r_edits = self.1.get_edits_no_follow(tokens, inserts_remaining);
+        // eprintln!("-{:?}", self);
         std::cmp::min(l_edits, r_edits)
     }
 }
 
-impl<T: Default + Clone + Eq, O, F, R> Rule for Map<R, F>
+impl<T: Token, O, F, R> Rule for Map<R, F>
 where
     R: Rule<Token = T>,
     F: FnOnce(R::Output) -> O + Copy,
@@ -290,22 +373,27 @@ where
         self,
         tokens: &[Self::Token],
         follow: impl Rule<Token = Self::Token>,
+        inserts_remaining: usize,
     ) -> Edits<Self::Token> {
-        eprintln!("+{:?} -> {:?}", self, follow);
-        let r = self.rule.get_edits(tokens, follow);
-        eprintln!("-{:?}", self);
+        // eprintln!("+{:?} -> {:?} : {:?}", self, follow, tokens);
+        let r = self.rule.get_edits(tokens, follow, inserts_remaining);
+        // eprintln!("-{:?}", self);
         r
     }
 
-    fn get_edits_no_follow(self, tokens: &[Self::Token]) -> Edits<Self::Token> {
-        eprintln!("+{:?}", self);
-        let r = self.rule.get_edits_no_follow(tokens);
-        eprintln!("-{:?}", self);
+    fn get_edits_no_follow(
+        self,
+        tokens: &[Self::Token],
+        inserts_remaining: usize,
+    ) -> Edits<Self::Token> {
+        // eprintln!("+{:?} : {:?}", self, tokens);
+        let r = self.rule.get_edits_no_follow(tokens, inserts_remaining);
+        // eprintln!("-{:?}", self);
         r
     }
 }
 
-impl<T: Default + Clone + Eq, R> Rule for List<R>
+impl<T: Token, R> Rule for List<R>
 where
     R: Rule<Token = T>,
 {
@@ -324,35 +412,48 @@ where
         self,
         tokens: &[Self::Token],
         follow: impl Rule<Token = Self::Token>,
+        inserts_remaining: usize,
     ) -> Edits<Self::Token> {
-        eprintln!("+{:?} -> {:?}", self, follow);
+        // eprintln!("+{:?} -> {:?} : {:?}", self, follow, tokens);
         if tokens.is_empty() {
-            eprintln!("-{:?}", self);
+            //     eprintln!("-{:?}", self);
             return Edits(vec![]);
         }
 
-        let one = self.0.and(self).and(follow).get_edits_no_follow(tokens);
+        let one = self
+            .0
+            .and(self)
+            .and(follow)
+            .get_edits_no_follow(tokens, inserts_remaining);
 
-        let two = follow.get_edits_no_follow(tokens);
+        let two = follow.get_edits_no_follow(tokens, inserts_remaining);
 
-        eprintln!("-{:?}", self);
+        // eprintln!("-{:?}", self);
         std::cmp::min(one, two)
     }
-    fn get_edits_no_follow(self, tokens: &[Self::Token]) -> Edits<Self::Token> {
-        eprintln!("+{:?}", self);
+
+    fn get_edits_no_follow(
+        self,
+        tokens: &[Self::Token],
+        inserts_remaining: usize,
+    ) -> Edits<Self::Token> {
+        // eprintln!("+{:?} : {:?}", self, tokens);
         if tokens.is_empty() {
-            eprintln!("-{:?}", self);
+            //     eprintln!("-{:?}", self);
             return Edits(vec![]);
         }
 
         let delete_all = Edits(vec![Edit::Delete; tokens.len()]);
-        let other = self.0.and(self).get_edits_no_follow(tokens);
-        eprintln!("-{:?}", self);
+        let other = self
+            .0
+            .and(self)
+            .get_edits_no_follow(tokens, inserts_remaining);
+        // eprintln!("-{:?}", self);
         std::cmp::min(delete_all, other)
     }
 }
 
-// impl<T: Default + Clone + Eq> Rule for PhantomData<T> {
+// impl<T: Token> Rule for PhantomData<T> {
 //     type Token = T;
 //     type Output = ();
 
