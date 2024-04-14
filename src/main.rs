@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{marker::PhantomData, time::Instant};
 
 mod pull_fix_parser;
 mod pull_parser;
@@ -21,12 +21,19 @@ enum Punctuation {
     Colon,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
     String(String),
     Number(usize),
     Punctuation(Punctuation),
     Eof,
+    Inserted,
+}
+
+impl Default for Token {
+    fn default() -> Self {
+        Token::Inserted
+    }
 }
 
 pub trait Source {
@@ -165,6 +172,116 @@ mod pull_grammar {
     }
 }
 
+mod pull_fix_grammar {
+    use crate::{pull_fix_parser::*, Json, Punctuation, Token};
+
+    fn punctuation(punct: Punctuation) -> impl Rule<Token = Token, Output = ()> {
+        single(move |token: &Token| match token {
+            Token::Punctuation(p) if *p == punct => true,
+            _ => false,
+        })
+        .map(|_| ())
+    }
+
+    fn string() -> impl Rule<Token = Token, Output = String> {
+        single(move |token: &Token| match token {
+            Token::String(_) => true,
+            _ => false,
+        })
+        .map(|token| {
+            if let Token::String(value) = token {
+                value
+            } else {
+                unreachable!()
+            }
+        })
+    }
+
+    fn number() -> impl Rule<Token = Token, Output = usize> {
+        single(move |token: &Token| match token {
+            Token::Number(_) => true,
+            _ => false,
+        })
+        .map(|token| {
+            if let Token::Number(value) = token {
+                value
+            } else {
+                unreachable!()
+            }
+        })
+    }
+
+    fn prop() -> impl Rule<Token = Token, Output = (String, Json)> {
+        string()
+            .and(punctuation(Punctuation::Colon))
+            .map(|(s, _)| s)
+            .and(JsonInnerRule)
+    }
+
+    fn object() -> impl Rule<Token = Token, Output = Vec<(String, Json)>> {
+        punctuation(Punctuation::LBrace)
+            .and(prop())
+            .and(
+                punctuation(Punctuation::Comma)
+                    .and(prop())
+                    .map(|(_, json)| json)
+                    .list(),
+            )
+            .and(punctuation(Punctuation::RBrace))
+            .map(|(((_, first), mut props), _)| {
+                props.insert(0, first);
+                props
+            })
+    }
+
+    fn array() -> impl Rule<Token = Token, Output = Vec<Json>> {
+        punctuation(Punctuation::LBracket)
+            .and(JsonInnerRule)
+            .and(
+                punctuation(Punctuation::Comma)
+                    .and(JsonInnerRule)
+                    .map(|(_, json)| json)
+                    .list(),
+            )
+            .and(punctuation(Punctuation::RBracket))
+            .map(|(((_, first), mut props), _)| {
+                props.insert(0, first);
+                props
+            })
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct JsonRule;
+
+    impl NamedRule for JsonRule {
+        type Token = Token;
+        type Output = Json;
+
+        fn get(self) -> impl Rule<Token = Self::Token, Output = Self::Output> {
+            string()
+                .map(Json::String)
+                .or(number().map(Json::Number))
+                .or(array().map(Json::Array))
+                .or(object().map(Json::Object))
+        }
+    }
+    #[derive(Clone, Copy, Debug)]
+    struct JsonInnerRule;
+
+    impl NamedRule for JsonInnerRule {
+        type Token = Token;
+        type Output = Json;
+
+        fn get(self) -> impl Rule<Token = Self::Token, Output = Self::Output> {
+            string().map(Json::String).or(number().map(Json::Number))
+        }
+    }
+
+    pub fn grammar() -> impl Rule<Token = Token, Output = Json> {
+        JsonRule
+    }
+}
+
 mod push_grammar {
     use crate::{push_parser::*, Json, Punctuation, Token};
 
@@ -287,18 +404,20 @@ fn main() {
         ],
     };
 
-    use pull_parser::Rule;
-    let grammar = pull_grammar::grammar();
+    use pull_fix_parser::Rule;
+    let grammar = pull_fix_grammar::grammar();
 
-    eprintln!("{:#?}", grammar.parse(&mut input));
+    grammar.get_edits_no_follow(&input.items);
 
-    let start = Instant::now();
-    for _ in 0..1_000_000 {
-        grammar.parse(&mut input);
-    }
-    let time = start.elapsed();
+    // eprintln!("{:#?}", grammar.parse(&mut input));
 
-    println!("{}", time.as_millis())
+    // let start = Instant::now();
+    // for _ in 0..1_000_000 {
+    //     grammar.parse(&mut input);
+    // }
+    // let time = start.elapsed();
+
+    // println!("{}", time.as_millis())
 
     // 'outer: for _ in 0..1_000_000 {
     //     let mut builder = push_fun.builder();
