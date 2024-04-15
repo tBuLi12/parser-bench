@@ -1,5 +1,7 @@
 use std::{marker::PhantomData, time::Instant};
 
+use crate::pull_fix_parser::single;
+
 mod pull_fix_parser;
 mod pull_parser;
 mod push_parser;
@@ -285,13 +287,8 @@ mod pull_fix_grammar {
         }
     }
 
-    pub fn grammar() -> impl Rule<Token = Token, Output = ()> {
-        punctuation(Punctuation::LBrace)
-            .and(string())
-            .and(punctuation(Punctuation::Colon))
-            .and(string())
-            .and(punctuation(Punctuation::RBrace))
-            .map(|_| {})
+    pub fn grammar() -> impl Rule<Token = Token, Output = Json> {
+        JsonRule
     }
 }
 
@@ -410,8 +407,20 @@ fn main() {
         i: 0,
         items: vec![
             Token::Punctuation(Punctuation::LBrace),
-            // Token::String("key".to_string()),
-            // Token::Punctuation(Punctuation::Colon),
+            Token::String("key".to_string()),
+            Token::Punctuation(Punctuation::Colon),
+            Token::String("value".to_string()),
+            Token::Punctuation(Punctuation::Comma),
+            Token::String("key".to_string()),
+            Token::Punctuation(Punctuation::Colon),
+            Token::String("value".to_string()),
+            Token::Punctuation(Punctuation::Comma),
+            Token::String("key".to_string()),
+            Token::Punctuation(Punctuation::Colon),
+            Token::String("value".to_string()),
+            Token::Punctuation(Punctuation::Comma),
+            Token::String("key".to_string()),
+            Token::Punctuation(Punctuation::Colon),
             Token::String("value".to_string()),
             Token::Punctuation(Punctuation::RBrace),
         ],
@@ -420,18 +429,18 @@ fn main() {
     use pull_fix_parser::Rule;
     let grammar = pull_fix_grammar::grammar();
 
-    let edits = grammar.get_edits_no_follow(&input.items, 5);
-    eprintln!("{:?}", edits);
+    // let edits = grammar.get_edits(&input.items[..9], single(TokenKind::Eof).list(), 9);
+    // eprintln!("{:?}", edits);
 
     // eprintln!("{:#?}", grammar.parse(&mut input));
 
-    // let start = Instant::now();
-    // for _ in 0..1_000_000 {
-    //     grammar.parse(&mut input);
-    // }
-    // let time = start.elapsed();
+    let start = Instant::now();
+    for _ in 0..1_000_000 {
+        grammar.parse(&mut input);
+    }
+    let time = start.elapsed();
 
-    // println!("{}", time.as_millis())
+    println!("{}", time.as_millis())
 
     // 'outer: for _ in 0..1_000_000 {
     //     let mut builder = push_fun.builder();

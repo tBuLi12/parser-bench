@@ -1,7 +1,42 @@
 use core::fmt;
-use std::{fmt::Debug, marker::PhantomData};
+use std::fmt::Debug;
 
 use crate::Source;
+
+struct Src<S: Source> {
+    inner: S,
+    buffer: Vec<S::Token>,
+}
+
+impl<S: Source> Src<S>
+where
+    S::Token: Token,
+{
+    fn get(&mut self) -> S::Token {
+        let token = self.buffer.remove(0);
+        if self.buffer.is_empty() {
+            self.buffer.push(self.inner.get());
+        }
+        token
+    }
+
+    fn peek(&self) -> &S::Token {
+        &self.buffer[0]
+    }
+
+    fn lookahead(&mut self, len: usize) -> &[S::Token] {
+        while self.buffer.len() < len {
+            self.buffer.push(self.inner.get());
+        }
+
+        &self.buffer
+    }
+
+    fn apply(&mut self, edits: Edits<S::Token>) {
+        let edited = edits.apply_to(std::mem::take(&mut self.buffer).into_iter());
+        self.buffer.extend(edited);
+    }
+}
 
 pub trait Token: Clone + Eq + Debug {
     type Kind: Eq + Copy;
@@ -68,7 +103,22 @@ impl<T: Token> Edits<T> {
 pub trait Rule: Copy + std::fmt::Debug {
     type Token: Token;
     type Output;
-    fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output>;
+    fn parse(
+        self,
+        mut input: impl Source<Token = Self::Token>,
+        follow: impl Rule<Token = Self::Token>,
+    ) -> Option<Self::Output> {
+        let mut src = Src {
+            buffer: vec![input.get()],
+            inner: input,
+        };
+        self.parse_src(&mut src, follow)
+    }
+    fn parse_src(
+        self,
+        input: &mut Src<impl Source<Token = Self::Token>>,
+        follow: impl Rule<Token = Self::Token>,
+    ) -> Option<Self::Output>;
     fn get_edits(
         self,
         tokens: &[Self::Token],
@@ -118,8 +168,12 @@ impl<T: NamedRule + Copy + Debug> Rule for T {
     type Token = <T as NamedRule>::Token;
     type Output = <T as NamedRule>::Output;
 
-    fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
-        self.get().parse(input)
+    fn parse_src(
+        self,
+        input: &mut Src<impl Source<Token = Self::Token>>,
+        follow: impl Rule<Token = Self::Token>,
+    ) -> Option<Self::Output> {
+        self.get().parse_src(input, follow)
     }
 
     fn get_edits(
@@ -186,7 +240,11 @@ impl<T: Token> Rule for Single<T> {
     type Token = T;
     type Output = T;
 
-    fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
+    fn parse_src(
+        self,
+        input: &mut Src<impl Source<Token = Self::Token>>,
+        _: impl Rule<Token = Self::Token>,
+    ) -> Option<Self::Output> {
         if input.peek().kind() == self.0 {
             Some(input.get())
         } else {
@@ -288,9 +346,20 @@ where
     type Token = T;
     type Output = (L::Output, R::Output);
 
-    fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
-        let l = self.0.parse(input)?;
-        let r = self.1.parse(input).unwrap();
+    fn parse_src(
+        self,
+        input: &mut Src<impl Source<Token = Self::Token>>,
+        follow: impl Rule<Token = Self::Token>,
+    ) -> Option<Self::Output> {
+        let l = self.0.parse_src(input, follow)?;
+        if let Some(r) = self.1.parse_src(input, follow) {
+            return Some((l, r));
+        }
+
+        let edits = self.1.get_edits(input.lookahead(5), follow, 5);
+        input.apply(edits);
+        let r = self.1.parse_src(input, follow).unwrap();
+
         Some((l, r))
     }
 
@@ -328,8 +397,14 @@ where
     type Token = T;
     type Output = O;
 
-    fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
-        self.0.parse(input).or_else(|| self.1.parse(input))
+    fn parse_src(
+        self,
+        input: &mut Src<impl Source<Token = Self::Token>>,
+        follow: impl Rule<Token = Self::Token>,
+    ) -> Option<Self::Output> {
+        self.0
+            .parse_src(input, follow)
+            .or_else(|| self.1.parse_src(input, follow))
     }
 
     fn get_edits(
@@ -365,8 +440,12 @@ where
 {
     type Token = T;
     type Output = O;
-    fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
-        self.rule.parse(input).map(self.fun)
+    fn parse_src(
+        self,
+        input: &mut Src<impl Source<Token = Self::Token>>,
+        follow: impl Rule<Token = Self::Token>,
+    ) -> Option<Self::Output> {
+        self.rule.parse_src(input, follow).map(self.fun)
     }
 
     fn get_edits(
@@ -400,9 +479,13 @@ where
     type Token = T;
     type Output = Vec<R::Output>;
 
-    fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
+    fn parse_src(
+        self,
+        input: &mut Src<impl Source<Token = Self::Token>>,
+        follow: impl Rule<Token = Self::Token>,
+    ) -> Option<Self::Output> {
         let mut out = vec![];
-        while let Some(item) = self.0.parse(input) {
+        while let Some(item) = self.0.parse_src(input, follow) {
             out.push(item)
         }
         Some(out)
@@ -457,7 +540,7 @@ where
 //     type Token = T;
 //     type Output = ();
 
-//     fn parse(self, input: &mut impl Source<Token = Self::Token>) -> Option<Self::Output> {
+//     fn parse(self, input: &mut Src<impl Source<Token = Self::Token>>, follow: impl Rule<Token = Self::Token>) -> Option<Self::Output> {
 //         Some(())
 //     }
 
